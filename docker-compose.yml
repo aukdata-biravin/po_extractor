@@ -1,0 +1,25 @@
+services:
+  po-extractor:
+    build:
+      context: ./backend      # build context is the backend folder
+      dockerfile: Dockerfile
+    container_name: po_extractor_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                  # secrets stay at the project root, never in the image
+    environment:
+      OUTPUT_DIR: /app/output
+    volumes:
+      - ./output:/app/output      # persist extracted files on the host
+      - ./frontend:/app/frontend  # serve frontend from project root (read-only)
+
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M

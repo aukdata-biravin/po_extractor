@@ -1,0 +1,22 @@
+# Files/directories excluded from the Docker build context (backend/)
+.venv
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+
+# Test/debug artefacts
+output
+temp_po_data
+debug_original_error.json
+debug_cleaned_error.json
+
+# PDF, text and JSON files that may be sitting in the backend folder during dev
+*.pdf
+*.txt
+!requirements-po-extraction.txt
+
+# IDE metadata
+.idea
+.vscode

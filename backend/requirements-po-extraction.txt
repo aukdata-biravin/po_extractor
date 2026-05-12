@@ -1,0 +1,32 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Purchase Order Extraction — Python dependencies
+#
+# Versions are pinned to the minimum known-good release for reproducibility.
+# Run `pip install --upgrade -r requirements-po-extraction.txt` to refresh,
+# then pin the new versions here after full regression testing.
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── PDF processing ────────────────────────────────────────────────────────────
+pymupdf>=1.24.0             # PDF rendering (OCR page rendering) + text extraction
+
+# ── AI / HTTP client ──────────────────────────────────────────────────────────
+openai>=1.3.0               # OpenAI-compatible client for NVIDIA integration
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic>=2.0.0             # Schema validation and serialisation
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi>=0.100.0            # REST API framework
+uvicorn[standard]>=0.24.0  # ASGI server (includes uvloop + httptools for speed)
+python-multipart>=0.0.6     # Required for FastAPI file upload handling
+
+# ── Config & environment ──────────────────────────────────────────────────────
+python-dotenv>=1.0.0        # .env file loading
+
+# ── JSON resilience ───────────────────────────────────────────────────────────
+json5>=0.9.0                # Forgiving JSON parser for AI model responses
+
+# ── OCR (Tesseract via pytesseract + Pillow for image preprocessing) ──────────
+# Tesseract itself is installed as a system package in the Dockerfile.
+pytesseract>=0.3.10         # Python wrapper for Tesseract OCR
+Pillow>=10.0.0              # Image processing required by pytesseract
