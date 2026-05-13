@@ -225,8 +225,8 @@ class TextExtractor:
           3. Fallback: first company block = buyer, second = seller
         """
         parties = {
-            "buyer":  {"company": None, "phone": None, "gstin": None, "address": None},
-            "seller": {"company": None, "phone": None, "gstin": None, "address": None}
+            "buyer":  {"company": None, "phone": None, "gstno": None, "tin": None, "address": None},
+            "seller": {"company": None, "phone": None, "gstno": None, "tin": None, "address": None}
         }
 
         COMPANY_PATTERN = r'([A-Z][A-Z0-9\s\.,&\-\'\/]+?)'
@@ -281,29 +281,53 @@ class TextExtractor:
                     parties["seller"]["phone"] = phone
                     logger.info(f"Seller by fallback: {company}")
 
-        # ── GSTIN extraction ─────────────────────────────────────────────────
+        # ── GSTIN extraction (only GSTIN/GSTN labels → gstno) ──────────────────
         all_gstins = re.findall(
-            rf'(?:TIN|GSTIN|GSTN)\s*:?\s*({GSTIN_PATTERN})',
+            rf'(?:GSTIN|GSTN)\s*:?\s*({GSTIN_PATTERN})',
             text, re.IGNORECASE
         )
 
         if len(all_gstins) >= 1:
-            for gstin in all_gstins:
-                pos = text.find(gstin)
+            for gstin_val in all_gstins:
+                pos = text.find(gstin_val)
                 buyer_pos  = text.find(parties["buyer"]["company"])  if parties["buyer"]["company"]  else -1
                 seller_pos = text.find(parties["seller"]["company"]) if parties["seller"]["company"] else -1
 
                 if buyer_pos != -1 and seller_pos != -1:
                     if abs(pos - buyer_pos) < abs(pos - seller_pos):
-                        if not parties["buyer"]["gstin"]:
-                            parties["buyer"]["gstin"] = gstin
+                        if not parties["buyer"]["gstno"]:
+                            parties["buyer"]["gstno"] = gstin_val
                     else:
-                        if not parties["seller"]["gstin"]:
-                            parties["seller"]["gstin"] = gstin
-                elif buyer_pos != -1 and not parties["buyer"]["gstin"]:
-                    parties["buyer"]["gstin"] = gstin
-                elif seller_pos != -1 and not parties["seller"]["gstin"]:
-                    parties["seller"]["gstin"] = gstin
+                        if not parties["seller"]["gstno"]:
+                            parties["seller"]["gstno"] = gstin_val
+                elif buyer_pos != -1 and not parties["buyer"]["gstno"]:
+                    parties["buyer"]["gstno"] = gstin_val
+                elif seller_pos != -1 and not parties["seller"]["gstno"]:
+                    parties["seller"]["gstno"] = gstin_val
+
+        # ── TIN extraction (only TIN label → tin) ────────────────────────────
+        all_tins = re.findall(
+            rf'(?<![A-Z])TIN\s*:?\s*({GSTIN_PATTERN})',
+            text, re.IGNORECASE
+        )
+
+        if len(all_tins) >= 1:
+            for tin_val in all_tins:
+                pos = text.find(tin_val)
+                buyer_pos  = text.find(parties["buyer"]["company"])  if parties["buyer"]["company"]  else -1
+                seller_pos = text.find(parties["seller"]["company"]) if parties["seller"]["company"] else -1
+
+                if buyer_pos != -1 and seller_pos != -1:
+                    if abs(pos - buyer_pos) < abs(pos - seller_pos):
+                        if not parties["buyer"]["tin"]:
+                            parties["buyer"]["tin"] = tin_val
+                    else:
+                        if not parties["seller"]["tin"]:
+                            parties["seller"]["tin"] = tin_val
+                elif buyer_pos != -1 and not parties["buyer"]["tin"]:
+                    parties["buyer"]["tin"] = tin_val
+                elif seller_pos != -1 and not parties["seller"]["tin"]:
+                    parties["seller"]["tin"] = tin_val
 
         logger.info(f"Final parties — Buyer: {parties['buyer']['company']} | "
                     f"Seller: {parties['seller']['company']}")
@@ -347,14 +371,18 @@ class TextExtractor:
             lines.append(f"- expiryDate: {dates['expiryDate']}")
         if parties["buyer"].get("company"):
             lines.append(f"- buyer.companyName: {parties['buyer']['company']}")
-        if parties["buyer"].get("gstin"):
-            lines.append(f"- buyer.gstin: {parties['buyer']['gstin']}")
+        if parties["buyer"].get("gstno"):
+            lines.append(f"- buyer.gstno: {parties['buyer']['gstno']}")
+        if parties["buyer"].get("tin"):
+            lines.append(f"- buyer.tin: {parties['buyer']['tin']}")
         if parties["buyer"].get("phone"):
             lines.append(f"- buyer.phone: {parties['buyer']['phone']}")
         if parties["seller"].get("company"):
             lines.append(f"- seller.companyName: {parties['seller']['company']}")
-        if parties["seller"].get("gstin"):
-            lines.append(f"- seller.gstin: {parties['seller']['gstin']}")
+        if parties["seller"].get("gstno"):
+            lines.append(f"- seller.gstno: {parties['seller']['gstno']}")
+        if parties["seller"].get("tin"):
+            lines.append(f"- seller.tin: {parties['seller']['tin']}")
         if parties["seller"].get("phone"):
             lines.append(f"- seller.phone: {parties['seller']['phone']}")
 

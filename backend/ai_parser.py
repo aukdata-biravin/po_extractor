@@ -266,7 +266,12 @@ class AIParser:
         if isinstance(obj, list):
             return [AIParser._clean_strings(item) for item in obj]
         if isinstance(obj, str):
-            # Collapse all whitespace sequences (spaces, tabs, newlines) to one space
+            # 1. Strip systemic metadata tags like "T( Auto PO )", "C( Auto PO )", etc.
+            # These are often artifacts from the source system or extraction labels
+            # that we don't want in the final JSON.
+            obj = re.sub(r'[A-Z]?\s*\(\s*Auto\s*PO\s*\)', '', obj, flags=re.IGNORECASE)
+
+            # 2. Collapse all whitespace sequences (spaces, tabs, newlines) to one space
             cleaned = re.sub(r'\s+', ' ', obj).strip()
             return cleaned if cleaned else None   # empty string → null
         return obj
@@ -425,18 +430,30 @@ class AIParser:
         - In formal enterprise POs, the buyer name and address appear in the header or letterhead.
         - In smaller/retail-format POs, the buyer may be a store name printed prominently at the top
         with an address block — treat that as the buyer.
+        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags like "T( Auto PO )", "C( Auto PO )", or "B( Auto PO )" if they appear near the address.
+        - The address may span multiple lines; collect all lines until a new section (e.g., "Vendor", "Ship To", or a horizontal line) begins.
         - Do NOT use the "Delivery Address" or "Ship To" address as the buyer address.
 
         buyer.companyName
         - Extract the buyer/store/company name exactly as printed.
 
         buyer.address
-        - Extract the address printed directly below the buyer company name in the document header or letterhead only. 
-        - Never use blocks labeled "Delivery Address", "Ship To", or "Distribution Center" for this field even if they appear on the same page.
+        - Extract the complete postal address of the buyer.
+        - The address usually appears below the buyer's company name and may span multiple lines (e.g., "GANDHI NAGAR" followed by "AVINASHI MAIN ROAD").
+        - COLLECT ALL lines that form the address.
+        - Address lines may appear alongside other fields (like TIN or Phone) on the same line — extract the address part carefully.
+        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags like "T( Auto PO )", "C( Auto PO )", etc. (e.g., if the document says "12, Road T( Auto PO )", extract ONLY "12, Road").
+        - Never use blocks labeled "Delivery Address", "Ship To", or "Distribution Center" for this field.
 
-        buyer.gstin
-        - Extract the buyer GSTIN / TIN / GSTN exactly as printed (value only, no label).
-        - If not found in the main header, look for a GSTN/GSTIN in the "Delivery Address" or "GSTIN Number Details" section and use that as the buyer GSTIN.
+        buyer.gstno
+        - LABEL RULE: Only extract this value if the document label is exactly "GSTIN", "GSTN", or "GSTIN No".
+        - If the document says only "TIN :" or "TIN No:", do NOT put it here — put it in buyer.tin instead.
+        - Extract the value only (no label), else null.
+
+        buyer.tin
+        - LABEL RULE: Only extract this value if the document label is exactly "TIN", "TIN No", or "Tax ID".
+        - If the document says only "GSTIN :" or "GSTN:", do NOT put it here — put it in buyer.gstno instead.
+        - Extract the value only (no label), else null.
 
         buyer.email
         - Extract buyer email exactly as printed, else null.
@@ -456,10 +473,17 @@ class AIParser:
         - Extract seller/vendor company name exactly as printed.
 
         seller.address
-        - Extract seller/vendor address exactly as printed.
+        - Extract the complete postal address of the seller/vendor exactly as printed.
+        - The address often spans multiple lines; collect all lines into a single string.
+        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags if present.
 
-        seller.gstin
-        - Extract seller GSTIN / TIN exactly as printed (value only, no label).
+        seller.gstno
+        - LABEL RULE: Only extract this value if the document label is exactly "GSTIN", "GSTN", or "GSTIN No".
+        - If the document says only "TIN :" or "TIN No:", do NOT put it here — put it in seller.tin instead.
+
+        seller.tin
+        - LABEL RULE: Only extract this value if the document label is exactly "TIN", "TIN No", or "Tax ID".
+        - If the document says only "GSTIN :" or "GSTN:", do NOT put it here — put it in seller.gstno instead.
 
         seller.email
         - Extract seller email exactly as printed, else null.
@@ -486,8 +510,8 @@ class AIParser:
         financialSummary.totalIGST
         - Extract Total IGST amount exactly as printed, else null.
 
-        financialSummary.totalGST
-        - Extract a combined Total GST figure only if printed as a single labeled total, else null.
+        financialSummary.totalTaxAmt
+        - Extract a combined Total GST/ Total Tax Amount else null.
         - Do NOT add CGST + SGST to populate this field.
 
         financialSummary.totalOrderValue
@@ -719,7 +743,8 @@ class AIParser:
                 "buyer": {
                     "companyName": "string or null",
                     "address": "string or null",
-                    "gstin": "string or null",
+                    "gstno": "string or null",
+                    "tin": "string or null",
                     "email": "string or null",
                     "phone": "string or null"
                 },
@@ -727,7 +752,8 @@ class AIParser:
                     "companyName": "string or null",
                     "address": "string or null",
                     "email": "string or null",
-                    "gstin": "string or null",
+                    "gstno": "string or null",
+                    "tin": "string or null",
                     "phone": "string or null"
                 },
                 "financialSummary": {
@@ -735,7 +761,7 @@ class AIParser:
                     "totalCGST": "string or null",
                     "totalSGST": "string or null",
                     "totalIGST": "string or null",
-                    "totalGST": "string or null",
+                    "totalTaxAmt": "string or null",
                     "totalOrderValue": "string or null",
                     "totalQuantity": "string or null",
                     "discountPercent": "string or null",

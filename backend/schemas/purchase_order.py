@@ -10,7 +10,8 @@ class BuyerInfo(BaseModel):
     """Buyer/Procurement organization details."""
     companyName: Optional[str] = None
     address: Optional[str] = None
-    gstin: Optional[str] = None
+    gstno: Optional[str] = None
+    tin: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
 
@@ -20,7 +21,8 @@ class SellerInfo(BaseModel):
     companyName: Optional[str] = None
     address: Optional[str] = None
     email: Optional[str] = None
-    gstin: Optional[str] = None
+    gstno: Optional[str] = None
+    tin: Optional[str] = None
     phone: Optional[str] = None
 
 
@@ -31,7 +33,7 @@ class FinancialSummary(BaseModel):
     totalCGST: Optional[str] = None
     totalSGST: Optional[str] = None
     totalIGST: Optional[str] = None
-    totalGST: Optional[str] = None
+    totalTaxAmt: Optional[str] = None
     totalOrderValue: Optional[str] = None
     totalQuantity: Optional[str] = None
     discountPercent: Optional[str] = None

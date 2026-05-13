@@ -26,7 +26,7 @@ from extractor import POExtractor  # noqa: E402
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)-8s | PID:%(process)d | %(name)s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 # Silence noisy third-party libraries
