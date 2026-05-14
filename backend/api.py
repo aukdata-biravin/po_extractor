@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
 
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("📁 Output directory: %s", settings.output_dir)
-    logger.info("🚀 API is available at: http://localhost:8000/home")
+    logger.info("🚀 API is available at: http://localhost:8000/home/")
     yield
     logger.info("🛑 Shutting down PO Extraction API")
 
@@ -136,7 +136,7 @@ async def extract_po(
     - Detects whether the PDF is searchable or scanned
     - Applies Tesseract OCR if needed
     - Extracts text with PyMuPDF spatial grid
-    - Parses with NVIDIA Mistral (two-pass: header then line items)
+    - Parses with NVIDIA Qwen (single-pass extraction)
 
     Returns the structured JSON Purchase Order plus optional paths to
     the saved `.txt` / `.json` / searchable-PDF artefacts.

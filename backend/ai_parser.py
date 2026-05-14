@@ -1,5 +1,5 @@
 """
-AI-based parsing of extracted text to Purchase Order JSON using NVIDIA API with Mistral model.
+AI-based parsing of extracted text to Purchase Order JSON using NVIDIA API with Qwen model.
 """
 
 import json
@@ -22,17 +22,15 @@ from config import settings
 from schemas.purchase_order import PurchaseOrder
 
 # ── Token-budget constants ────────────────────────────────────────────────────
-# The NVIDIA Mixtral endpoint enforces a 64 k *total* context window
-# (input tokens + output tokens combined).  We keep a safety margin so we
-# never send a request that would exceed the limit.
-_MODEL_CONTEXT_LIMIT = 63_000  # leave 1 k headroom below the hard 64 k cap
+# Qwen3.5 supports up to 262k tokens; we cap conservatively at 100k for safety.
+_MODEL_CONTEXT_LIMIT = 100_000
 _CHARS_PER_TOKEN     = 3.5     # conservative character-to-token ratio for English
 
 logger = logging.getLogger(__name__)
 
 
 class AIParser:
-    """Parses extracted text using NVIDIA API with Mistral model."""
+    """Parses extracted text using NVIDIA API with Qwen model."""
 
     def __init__(self) -> None:
         """
@@ -92,8 +90,26 @@ class AIParser:
             temperature=0.1,
             max_tokens=safe_max_tokens,
             top_p=1,
+            extra_body={"chat_template_kwargs": {"thinking": False}},
         )
-        response_text = response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        # Qwen3 may put its answer in reasoning_content when thinking is active;
+        # fall back to that if content is empty.
+        response_text = (msg.content or "").strip()
+        if not response_text:
+            response_text = getattr(msg, "reasoning_content", "") or ""
+            if response_text:
+                logger.warning("message.content was empty — using reasoning_content fallback")
+
+        # Strip <think>...</think> blocks produced by chain-of-thought reasoning
+        response_text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+
+        if not response_text:
+            raise ValueError(
+                "Model returned an empty response. "
+                "The document may be too large or the model is not available."
+            )
+
         logger.info("API response received (%d chars, requested %d output tokens)",
                     len(response_text), safe_max_tokens)
         return self._extract_json_from_response(response_text)
@@ -102,35 +118,33 @@ class AIParser:
         """Extract clean JSON string from a model response (handles markdown fences, comments, prose)."""
         response_text = response_text.strip()
 
-        # Search for ```json fence anywhere (model may add prose before it)
-        fence_idx = response_text.find("```json")
-        if fence_idx != -1:
-            json_start = response_text.find("\n", fence_idx + 7)
-            if json_start == -1:
-                json_start = fence_idx + 7
-            else:
-                json_start += 1
-            json_end = response_text.rfind("```")
-            if json_end > json_start:
-                response_text = response_text[json_start:json_end].strip()
-            else:
-                response_text = response_text[json_start:].strip()
-        elif response_text.startswith("```"):
-            json_start = response_text.find("\n", 3)
-            if json_start == -1:
-                json_start = 3
-            else:
-                json_start += 1
-            json_end = response_text.rfind("```")
-            if json_end > json_start:
-                response_text = response_text[json_start:json_end].strip()
-            else:
-                response_text = response_text[json_start:].strip()
+        # 1. Try markdown fences first
+        fence_patterns = [r"```json\s*(.*?)\s*```", r"```\s*(.*?)\s*```"]
+        for pattern in fence_patterns:
+            match = re.search(pattern, response_text, re.DOTALL)
+            if match:
+                response_text = match.group(1).strip()
+                break
         else:
-            # No fence — find first { to skip any prose preamble
-            brace_idx = response_text.find("{")
-            if brace_idx != -1:
-                response_text = response_text[brace_idx:].strip()
+            # 2. No fence — find the outermost { } or [ ]
+            # Find first occurrence of { or [
+            start_idx_brace = response_text.find("{")
+            start_idx_bracket = response_text.find("[")
+            
+            if start_idx_brace != -1 and (start_idx_bracket == -1 or start_idx_brace < start_idx_bracket):
+                # Starts with a brace
+                start_idx = start_idx_brace
+                end_idx = response_text.rfind("}")
+            elif start_idx_bracket != -1:
+                # Starts with a bracket
+                start_idx = start_idx_bracket
+                end_idx = response_text.rfind("]")
+            else:
+                start_idx = -1
+                end_idx = -1
+
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                response_text = response_text[start_idx:end_idx + 1].strip()
 
         # Strip JS-style // comments (invalid in JSON)
         response_text = re.sub(r'//[^\n]*', '', response_text)
@@ -176,6 +190,9 @@ class AIParser:
                 "All JSON parse attempts failed (%s): %s  [debug files → %s]",
                 context, err, debug_dir,
             )
+            # Log the first 200 chars to help identify the issue in the terminal
+            snippet = text[:200].replace('\n', ' ')
+            logger.error(f"Failed JSON snippet ({context}): {snippet}...")
             raise
 
     def parse_po_text(
@@ -184,9 +201,7 @@ class AIParser:
         confirmed_section: str = ""
     ) -> PurchaseOrder:
         """
-        Parse extracted PDF text using a two-pass approach:
-          Pass 1: Extract header fields (poNumber, poDate, buyer, seller, financials, etc.)
-          Pass 2: Extract ALL line items (focused call — avoids model truncation)
+        Parse extracted PDF text using a single-pass approach.
 
         Args:
             extracted_text: Text extracted from PDF using PyMuPDF
@@ -198,52 +213,38 @@ class AIParser:
         try:
             system_prompt = self._get_system_prompt()
 
-            # ── PASS 1: Header + financials ──────────────────────────────────────
-            logger.info("Pass 1: Extracting header / financial summary...")
-            header_prompt = self._get_header_prompt(
+            # ── SINGLE PASS: All fields + line items ─────────────────────────────
+            logger.info("Extracting PO data in a single pass...")
+            user_prompt = self._get_extraction_prompt(
                 extracted_text,
                 confirmed_section=confirmed_section
             )
-            raw_header = self._call_api(
-                system_prompt, header_prompt, max_tokens=settings.header_max_tokens
+            
+            # 32k tokens to handle large POs (35+ items) without truncation
+            raw_response = self._call_api(
+                system_prompt, user_prompt, max_tokens=32768
             )
-            header_data = self._parse_json(raw_header, context="header")
-            if "purchaseOrder" in header_data:
-                header_data = header_data["purchaseOrder"]
-
-            # ── PASS 2: Line items ────────────────────────────────────────────────
-            logger.info("Pass 2: Extracting ALL line items...")
-            items_prompt = self._get_items_prompt(extracted_text)
-            raw_items = self._call_api(
-                system_prompt, items_prompt, max_tokens=settings.items_max_tokens
-            )
-
-            items_data = self._parse_json(raw_items, context="items")
-            # Accept either {"items": [...]} or [...]
-            if isinstance(items_data, dict):
-                if "items" in items_data:
-                    items_list = items_data["items"]
-                elif "purchaseOrder" in items_data:
-                    items_list = items_data["purchaseOrder"].get("items", [])
-                else:
-                    items_list = []
-            elif isinstance(items_data, list):
-                items_list = items_data
+            
+            data = self._parse_json(raw_response, context="po_extraction")
+            
+            # Handle possible nesting in model output
+            if "purchaseOrder" in data:
+                po_data = data["purchaseOrder"]
             else:
-                items_list = []
+                po_data = data
 
-            logger.info(f"Pass 2 extracted {len(items_list)} line items")
+            # Ensure items list exists
+            if "items" not in po_data:
+                po_data["items"] = []
 
-            # ── Merge results ─────────────────────────────────────────────────────
-            header_data["items"] = items_list
             # Clean whitespace from all string fields before schema validation.
-            # Fixes issues like extra spaces ("PAZHAMUDIR      NILAYAM") and
-            # embedded newlines in company names, addresses, etc.
-            header_data = self._clean_strings(header_data)
-            purchase_order = PurchaseOrder(**header_data)
+            po_data = self._clean_strings(po_data)
 
-            logger.info("Successfully parsed Purchase Order with NVIDIA Mistral API (two-pass)")
-            return purchase_order
+            # Validate with Pydantic
+            po_obj = PurchaseOrder(**po_data)
+
+            logger.info("Successfully parsed Purchase Order with NVIDIA Qwen API (single-pass)")
+            return po_obj
 
         except ValidationError as e:
             logger.error(f"Failed to validate Purchase Order schema: {e}")
@@ -398,375 +399,207 @@ class AIParser:
     def _get_system_prompt(self) -> str:
         return """Extract structured JSON from the provided purchase order document.
 
-        GOLDEN RULES:
-        - Return ONLY valid JSON. No preamble, no markdown fences, no extra text.
-        - NEVER CALCULATE. NEVER FORMAT. Extract ONLY what is physically printed in the document.
-        - Copy numeric values exactly as printed — do not strip commas, do not round, do not reformat.
-        Example: if the document shows "61,506" extract "61,506". If it shows "2,340.00" extract "2,340.00".
-        - If a value is not present in the document, return null.
-        - If a value is printed as 0 or 0.00, extract it as-is — do not treat it as null.
-        - Do not derive, infer, or compute any field from other fields.
-        - Do not strip labels — extract the raw value only (e.g., GSTIN value, not "GSTIN: 33XXXX").
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        PURCHASE ORDER HEADER
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        purchaseOrder.poNumber
-        - Extract the PO Number / Purchase Order Number / P.O. Number / Buyer Order Number exactly as printed.
-
-        purchaseOrder.poDate
-        - Extract Purchase Order Date / PO Date / Date exactly as printed.
-
-        purchaseOrder.expiryDate
-        - Extract Expiry Date / P.O. Expiry / Valid Until exactly as printed, else null.
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        BUYER (the entity issuing / receiving the PO)
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        IDENTIFICATION RULE:
-        - The BUYER is the company or store placing the order.
-        - In formal enterprise POs, the buyer name and address appear in the header or letterhead.
-        - In smaller/retail-format POs, the buyer may be a store name printed prominently at the top
-        with an address block — treat that as the buyer.
-        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags like "T( Auto PO )", "C( Auto PO )", or "B( Auto PO )" if they appear near the address.
-        - The address may span multiple lines; collect all lines until a new section (e.g., "Vendor", "Ship To", or a horizontal line) begins.
-        - Do NOT use the "Delivery Address" or "Ship To" address as the buyer address.
-
-        buyer.companyName
-        - Extract the buyer/store/company name exactly as printed.
-
-        buyer.address
-        - Extract the complete postal address of the buyer.
-        - The address usually appears below the buyer's company name and may span multiple lines (e.g., "GANDHI NAGAR" followed by "AVINASHI MAIN ROAD").
-        - COLLECT ALL lines that form the address.
-        - Address lines may appear alongside other fields (like TIN or Phone) on the same line — extract the address part carefully.
-        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags like "T( Auto PO )", "C( Auto PO )", etc. (e.g., if the document says "12, Road T( Auto PO )", extract ONLY "12, Road").
-        - Never use blocks labeled "Delivery Address", "Ship To", or "Distribution Center" for this field.
-
-        buyer.gstno
-        - LABEL RULE: Only extract this value if the document label is exactly "GSTIN", "GSTN", or "GSTIN No".
-        - If the document says only "TIN :" or "TIN No:", do NOT put it here — put it in buyer.tin instead.
-        - Extract the value only (no label), else null.
-
-        buyer.tin
-        - LABEL RULE: Only extract this value if the document label is exactly "TIN", "TIN No", or "Tax ID".
-        - If the document says only "GSTIN :" or "GSTN:", do NOT put it here — put it in buyer.gstno instead.
-        - Extract the value only (no label), else null.
-
-        buyer.email
-        - Extract buyer email exactly as printed, else null.
-
-        buyer.phone
-        - Extract buyer phone/mobile exactly as printed, else null.
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        SELLER (the vendor/supplier fulfilling the PO)
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        IDENTIFICATION RULE:
-        - The SELLER is the vendor/supplier delivering the goods.
-        - Typically in a "Vendor" / "Seller" / "Supplier" section of the document.
-
-        seller.companyName
-        - Extract seller/vendor company name exactly as printed.
-
-        seller.address
-        - Extract the complete postal address of the seller/vendor exactly as printed.
-        - The address often spans multiple lines; collect all lines into a single string.
-        - PURGE TAGS: Strictly OMIT and REMOVE system metadata tags if present.
-
-        seller.gstno
-        - LABEL RULE: Only extract this value if the document label is exactly "GSTIN", "GSTN", or "GSTIN No".
-        - If the document says only "TIN :" or "TIN No:", do NOT put it here — put it in seller.tin instead.
-
-        seller.tin
-        - LABEL RULE: Only extract this value if the document label is exactly "TIN", "TIN No", or "Tax ID".
-        - If the document says only "GSTIN :" or "GSTN:", do NOT put it here — put it in seller.gstno instead.
-
-        seller.email
-        - Extract seller email exactly as printed, else null.
-
-        seller.phone
-        - Extract seller phone/mobile exactly as printed, else null.
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        FINANCIAL SUMMARY
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        RULE: Extract only from the summary/footer/totals section of the document.
-        Do NOT sum item-level values. Do NOT calculate. Extract only what is printed.
-
-        financialSummary.totalBasicValue
-        - Extract Total Basic Value / Subtotal / Taxable Amount exactly as printed, else null.
-
-        financialSummary.totalCGST
-        - Extract Total CGST amount exactly as printed, else null.
-
-        financialSummary.totalSGST
-        - Extract Total SGST amount exactly as printed, else null.
-
-        financialSummary.totalIGST
-        - Extract Total IGST amount exactly as printed, else null.
-
-        financialSummary.totalTaxAmt
-        - Extract a combined Total GST/ Total Tax Amount else null.
-        - Do NOT add CGST + SGST to populate this field.
-
-        financialSummary.totalOrderValue
-        - Extract the grand total / Net Total / Total Order Value / Total Amount exactly as printed.
-
-        financialSummary.discountPercent
-        - Extract overall discount percentage exactly as printed, else null.
-
-        financialSummary.discountAmt
-        - Extract overall discount amount exactly as printed, else null.
-
-        financialSummary.totalQuantity
-        - Extract total quantity from the summary/footer row exactly as printed.
-        - It may be labeled: "Total Qty", "Grand Total of Qty", "Total Units", or appear unlabeled
-        as a number positioned under the Qty column in a totals row (e.g., "NET TOTAL  174  3640.76"
-        — the value under the Qty column is 174).
-        - Do NOT confuse with the grand total amount.
-
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        LINE ITEMS
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-        GENERAL RULES:
-        - Extract each line item independently. Do not merge separate items.
-        - A single item may span multiple text rows — collect all parts before mapping.
-        - Extract all values exactly as printed. Do not reformat, round, or calculate.
-        - ZERO VALUES ARE DATA: If a value is 0, 0.0, or 0.00 in the document, you MUST extract it exactly as it appears. Do NOT treat 0 as null.
-        - EXAMPLE FOR VERTICAL TAX STACKING RULE (RELIANCE FORMAT): 
-          One item occupies a block of 4 physical rows. The column headers for the last two columns are:
-            CGST(%) | CGST
-            SGST(%) | SGST
-            CESS(%) | CESS
-            CessFxdRt | CessFxdVl
-          These headers do NOT repeat per item. Map by row position within each item block.
-
-          EXAMPLE — Item 1 in the document:
-            Row 1: 1  490001912  8906001050490  MOTHER RECP AP GINGER PCKLE 300G  1.000  CAR  3,150.00  2,340.00      2.50    58.50   2,340.00
-            Row 2:    20019000                  25.11.2025                                                             2.50    58.50
-            Row 3:                              SAHO                                                                   0.00     0.00
-            Row 4:                                                                 30.000   EA   105.00               0.00     0.00
-
-          MANDATORY MAPPING for this item:
-            srNo=1, articleCode=490001912, eanCode=8906001050490
-            productDescription="MOTHER RECP AP GINGER PCKLE 300G"
-            quantityCarton="1.000", uomCarton="CAR", mrpcarton="3,150.00"
-            basicCostPrice="2,340.00", totalBaseValue="2,340.00"
-            cgstPercent="2.50", cgstAmt="58.50"   ← from Row 1 tax columns
-            sgstPercent="2.50", sgstAmt="58.50"   ← from Row 2 tax columns
-            cessPercent="0.00", cessAmt="0.00"    ← from Row 3 tax columns
-            cessFxdRt="0.00", cessFxdVl="0.00"   ← from Row 4 tax columns (CRITICAL: these must NOT be null!)
-            quantityEach="30.000", uomEach="EA", mrpeach="105.00"
-
-          KEY RULE: Even if cessFxdRt and cessFxdVl are "0.00", you MUST extract them as "0.00". NEVER return null for these fields if a row exists with two numbers in the tax column area.
-
-        SPLIT-ROW ITEM ASSEMBLY RULE (critical for this document):
-        Some PDFs render a single line item across TWO consecutive extracted text rows because
-        the product description overflows and the PDF renderer wraps it to the next row:
-
-          Row A:  <srNo>  [no articleCode]  [no description]  <MRP>  <cost>  <gst%>  <rate>  <qty>  <total>
-          Row B:          <articleCode>      <full description>
-
-        These two rows belong to the SAME item. Assemble them as one:
-          - srNo             → from Row A
-          - articleCode      → from Row B
-          - productDescription → full text from Row B (plus any further continuation rows)
-          - All numeric fields (MRP, basicCostPrice, gstPercent, landingRate, quantityEach, totalValueWithTax)
-            → from Row A
-
-        DETECTION SIGNAL: A row has numeric price/qty/total values but is missing articleCode
-        AND the very next row begins with a numeric code followed by text but has NO numerics.
-        → Those two rows are one item.
-
-        IMPORTANT:
-        - VERTICAL TAX STACKING RULE: In some documents (e.g., Reliance), tax columns like CGST, SGST, CESS, and Fixed Rates are stacked vertically within the same item block across multiple physical lines. You must read all lines belonging to an item and map the corresponding values based on their horizontal alignment with the column headers.
-        - Do NOT create a separate item for Row B alone.
-        - Do NOT create an item from Row B's numbers (it has none).
-        - Do NOT skip Row A's numeric values.
-        - Do NOT merge two genuinely different items that both have their own srNo and numbers.
-
-        srNo
-        - Extract serial/item/line number exactly as printed.
-
-        articleCode
-        - Extract article code / item code / product code exactly as printed.
-
-        hsnCode
-        - Extract HSN / SAC code exactly as printed, else null.
-        - STRICT: Do NOT map quantity, EAN, or article codes here.
-
-        eanCode
-        - Extract EAN / barcode / UPC exactly as printed, else null.
-
-        vendorArticleNo
-        - Extract vendor article number exactly as printed if present as a distinct column, else null.
-
-        vendorItemNo
-        - Extract vendor item number exactly as printed if present as a distinct column, else null.
-
-        productDescription
-        - Extract full product description / material description exactly as printed.
-        - If it wraps across multiple rows, extract the complete text.
-
-        deliveryDate
-        - Extract item-level delivery date exactly as printed, else null.
-
-        ─── QUANTITY & UOM ──────────────────────────────────────────
-
-        quantityCarton
-        - Extract carton/box/case quantity exactly as printed if a carton UOM row exists.
-
-        uomCarton
-        - Extract the UOM label for the carton row exactly as printed (e.g., CAR, C01, C02, CV, E01, E02).
-
-        quantityEach
-        - Extract the each/unit/individual quantity exactly as printed.
-        - If the PO has only a single quantity column (no carton/each split), put that value here.
-        - If the PO has separate carton and each rows, put the each/unit row value here.
-
-        uomEach
-        - Extract the UOM label for the each/unit row exactly as printed (e.g., EA, Nos, Pcs).
-        ─── MRP ─────────────────────────────────────────────────────
-
-        mrpcarton
-        - Extract MRP printed for the carton/case row exactly as printed, else null.
-
-        mrpeach
-        - Extract the MRP printed for the each/unit row.
-        - If the PO has only a single MRP column (no dual rows), put that value here.
-
-        ─── PRICING ─────────────────────────────────────────────────
-
-        basicCostPrice
-        - Extract the unit cost/rate BEFORE tax exactly as printed.
-        - Labeled: Base Cost, Base Cost Price, Unit Price, Rate, Basic Cost Price.
-        - Extract the per-unit/per-carton value exactly as it appears — do not multiply.
-
-        landingRate
-        - Extract the unit rate AFTER tax exactly as printed if that column exists, else null.
-        - Labeled: Landing Rate, Rate incl. tax.
-
-        ─── TAX ─────────────────────────────────────────────────────
-
-        TAX COLUMN FORMAT VARIANTS:
-        Variant A — Stacked columns (e.g., Reliance format):
-            Percentage rows: CGST(%) / SGST(%)
-            Amount rows:     CGST amt / SGST amt
-            Map each printed value to its field by vertical position.
-
-        Variant B — Single GST column (e.g., retail/auto-PO format):
-            One "GST %" column and one GST amount column per item.
-            Map to gstPercent and gstAmt only.
-            Leave cgstPercent, sgstPercent, cgstAmt, sgstAmt as null.
-
-        gstPercent
-        - Extract combined GST % exactly as printed ONLY if a single "GST %" column exists.
-        - Do NOT populate from CGST% or SGST% values.
-
-        cgstPercent
-        - Extract CGST % exactly as printed if a CGST(%) column exists, else null.
-
-        sgstPercent
-        - Extract SGST % exactly as printed if an SGST(%) column exists, else null.
-
-        igstPercent
-        - Extract IGST % exactly as printed if present, else null.
-
-        cgstAmt
-        - Extract CGST amount exactly as printed if present, else null.
-
-        sgstAmt
-        - Extract SGST amount exactly as printed if present, else null.
-
-        igstAmt
-        - Extract IGST amount exactly as printed if present, else null.
-
-        gstAmt
-        - Extract combined GST amount exactly as printed ONLY if a single GST amount column exists.
-        - Do NOT add cgstAmt + sgstAmt to populate this.
-
-        cessPercent
-        - Extract CESS percentage exactly as printed. 
-        - IMPORTANT: In complex layouts (like Reliance), CESS% often appears on a separate line BELOW the CGST/SGST lines in the same item block. Look vertically down the tax columns.
-        - Extract 0.00 if explicitly printed; only return null if the cell is truly blank.
-
-        cessAmt
-        - Extract CESS amount exactly as printed. 
-        - Look vertically down the tax columns if not on the main line.
-        - Extract 0.00 if explicitly printed.
-
-        cessFxdVl
-        - Extract CESS Fixed Value exactly as printed if present (often at the bottom of the tax column stack), else null.
-
-        cessFxdRt
-        - Extract CESS Fixed Rate exactly as printed if present (often at the bottom of the tax column stack), else null.
-
-        totalTaxAmt
-        - Extract total tax amount exactly as printed ONLY if it appears as a labeled sum in the item row.
-        - Do NOT calculate. If not explicitly printed, return null.
-
-        totalBaseValue
-        - Extract taxable/base amount for the line item exactly as printed if present, else null.
-        - Do NOT calculate.
-
-        totalValueWithTax
-        - Extract the final line item total inclusive of tax exactly as printed if present, else null.
-        - Labeled: Total Amount, Amount, Line Total.
-        - Do NOT calculate. If not explicitly printed, return null.
-
-        discountPercent
-        - Extract item-level discount percentage exactly as printed, else null.
-
-        discountAmt
-        - Extract item-level discount amount exactly as printed, else null.
-
-        Return JSON strictly in the schema structure provided.
-        """
+**CORE RULES:**
+- Return ONLY valid JSON. No preamble, no markdown fences, no extra text.
+- NEVER CALCULATE. NEVER FORMAT. Extract ONLY what is physically printed.
+- Copy numeric values exactly as printed (e.g., "61,506" not 61506; "2,340.00" not 2340).
+- Missing value → OMIT THE KEY ENTIRELY. Do NOT output `"field": null`. Just leave the key out to save tokens.
+- Printed 0/0.00 → extract as-is `"0.00"`. Never omit or treat 0 as null.
+- Do not derive, infer, or compute any field. Do not strip labels — extract values only.
+- **LAYOUT ADAPTABILITY:** If standard headers/labels are missing or split across multiple lines, rely on semantic context and typical PO structures to map values to the correct schema fields.
+- **SPEED OPTIMIZATION:** Return MINIFIED JSON without indentation, line breaks, or extra spaces.
+
+---
+
+### PURCHASE ORDER HEADER
+- **purchaseOrder.poNumber** — PO Number / Purchase Order Number / P.O. Number / Buyer Order Number, exactly as printed.
+- **purchaseOrder.poDate** — Purchase Order Date / PO Date / Date, exactly as printed.
+- **purchaseOrder.expiryDate** — Expiry Date / P.O. Expiry / Valid Until, exactly as printed, else null.
+
+---
+
+### BUYER (entity issuing/receiving the PO)
+**Identification:** Buyer is the company/store placing the order. In formal POs, name/address appear in header/letterhead. In retail-format POs, the store name printed prominently at top with address block is the buyer. Never use "Delivery Address" / "Ship To" as buyer address.
+**PURGE TAGS:** Strictly remove system metadata tags like `T( Auto PO )`, `C( Auto PO )`, `B( Auto PO )` wherever they appear.
+
+- **buyer.companyName** — Buyer/store/company name exactly as printed.
+- **buyer.address** — Complete postal address (all lines, collected into one string). Extract the text lines immediately below the buyer company name (e.g., street, area, city) even if there is no "Address" label. Extract address part even if other fields (TIN, Phone) appear on the same line. Purge tags. Never use "Delivery Address"/"Ship To"/"Distribution Center" blocks.
+- **buyer.gstno** — Only if label is exactly "GSTIN", "GSTN", or "GSTIN No". Not for "TIN"/"TIN No" labels. Value only. (Note: If buyer GSTNO is printed under the Delivery Address block, you MUST extract it here).
+- **buyer.tin** — Only if label is exactly "TIN", "TIN No", or "Tax ID". Not for "GSTIN"/"GSTN" labels. Value only.
+- **buyer.pan** — Only if label is exactly "PAN" or "PAN No". Format: 5 uppercase letters + 4 digits + 1 uppercase letter (e.g., CMWPM2648Q). Do NOT extract from within a GSTIN. Value only.
+- **buyer.email** — Exactly as printed. (Note: If buyer Email is printed under the Delivery Address block, you MUST extract it here).
+- **buyer.phone** — Exactly as printed.
+
+---
+
+### SELLER (vendor/supplier fulfilling the PO)
+**Identification:** Seller is the vendor/supplier delivering goods, typically in a "Vendor"/"Seller"/"Supplier" section.
+
+- **seller.companyName** — Exactly as printed.
+- **seller.address** — Complete postal address, all lines collected. Purge tags.
+- **seller.gstno** — Same label rules as buyer.gstno.
+- **seller.tin** — Same label rules as buyer.tin.
+- **seller.pan** — Same label rules as buyer.pan.
+- **seller.email** — Exactly as printed, else null.
+- **seller.phone** — Exactly as printed, else null.
+
+---
+
+### FINANCIAL SUMMARY
+Extract only from the summary/footer/totals section. Do NOT sum item-level values. Do NOT calculate.
+
+- **financialSummary.totalBasicValue** — Total Basic Value / Subtotal / Taxable Amount, else null.
+- **financialSummary.totalCGST** — Total CGST amount, else null.
+- **financialSummary.totalSGST** — Total SGST amount, else null.
+- **financialSummary.totalIGST** — Total IGST amount, else null.
+- **financialSummary.totalTaxAmt** — Combined Total GST / Total Tax Amount. Do NOT add CGST + SGST, else null.
+- **financialSummary.totalOrderValue** — Grand total / Net Total / Total Order Value / Total Amount, exactly as printed.
+- **financialSummary.discountPercent** — Overall discount %, else null.
+- **financialSummary.discountAmt** — Overall discount amount, else null.
+- **financialSummary.gstCompensationCess** — From summary footer exactly as printed, else null.
+- **financialSummary.gstAdditionalCess** — From summary footer exactly as printed, else null.
+- **financialSummary.totalQuantity** — Total Qty / Grand Total of Qty / Total Units, or the unlabeled number under the Qty column in the totals row (e.g., "NET TOTAL 174 3640.76" → 174). Do NOT confuse with grand total amount.
+
+---
+
+### LINE ITEMS
+**General rules:**
+- Extract each line item independently; do not merge separate items.
+- A single item may span multiple text rows — collect all parts before mapping.
+- Extract all values exactly as printed. Do not reformat, round, or calculate.
+- **ZERO VALUES ARE DATA:** If a value is 0, 0.0, or 0.00, extract it exactly. Never treat 0 as null.
+
+**Vertical Tax Stacking Rule (Reliance format):** One item occupies a block of 4 physical rows. Tax column headers are:
+```
+CGST(%) | CGST
+SGST(%) | SGST
+CESS(%) | CESS
+CessFxdRt | CessFxdVl
+```
+Headers do NOT repeat per item. Map by row position within each item block.
+
+Example — Item 1:
+```
+Row 1: 1  490001912  8906001050490  MOTHER RECP AP GINGER PCKLE 300G  1.000  CAR  3,150.00  2,340.00  2.50  58.50  2,340.00
+Row 2:    20019000                  25.11.2025                                               2.50  58.50
+Row 3:                              SAHO                                                     0.00   0.00
+Row 4:                                                                 30.000  EA  105.00    0.00   0.00
+```
+Mandatory mapping: srNo=1, articleCode=490001912, eanCode=8906001050490, productDescription="MOTHER RECP AP GINGER PCKLE 300G", quantityCarton="1.000", uomCarton="CAR", mrpcarton="3,150.00", basicCostPrice="2,340.00", totalBaseValue="2,340.00", cgstPercent="2.50", cgstAmt="58.50" (Row 1), sgstPercent="2.50", sgstAmt="58.50" (Row 2), cessPercent="0.00", cessAmt="0.00" (Row 3), cessFxdRt="0.00", cessFxdVl="0.00" (Row 4 — **CRITICAL: must be "0.00", never null if a row exists**), quantityEach="30.000", uomEach="EA", mrpeach="105.00".
+
+**Split-Row Item Assembly Rule:** Some PDFs render one item across two consecutive rows because the description overflows. Assemble as one item.srNo from Row A; articleCode and productDescription from Row B; all numerics from Row A.
+**Detection signal:** A row has numeric price/qty/total but no articleCode, AND the next row has a numeric code + text but no numerics → same item.
+
+---
+
+**Field definitions for LINE ITEMS:**
+- **srNo** — Serial/item/line number exactly as printed.
+- **articleCode** — Article/item/product code exactly as printed.
+- **hsnCode** — HSN/SAC code exactly as printed, else null.
+- **eanCode** — EAN/barcode/UPC exactly as printed, else null.
+- **vendorArticleNo** — Vendor article number if present as a distinct column, else null.
+- **vendorItemNo** — Vendor item number if present as a distinct column, else null.
+- **productDescription** — Full description exactly as printed, including wrapped text.
+- **deliveryDate** — Item-level delivery date exactly as printed, else null.
+- **quantityCarton** / **uomCarton** — Carton/box/case quantity and UOM if explicitly specified.
+- **quantityEach** / **uomEach** — Each/unit quantity and UOM. If the PO has only one "Qty" or "Quantity" column without specifying carton vs each, map it here to quantityEach.
+- **mrpcarton** — Carton/box MRP if explicitly specified.
+- **mrpeach** — Unit MRP. If the PO has only one "MRP" column, map it here to mrpeach.
+- **basicCostPrice** — Unit cost/rate BEFORE tax (Basic, Cost Price, Basic Rate).
+- **landingRate** — Unit rate AFTER tax (Landing Rate, Landing, Rate incl. tax). Extract this even if the value is identical to the MRP.
+- **gstPercent** — Combined GST % ONLY if a single "GST %" column exists.
+- **cgstPercent** / **sgstPercent** / **igstPercent** — Component GST percentages if present.
+- **cgstAmt** / **sgstAmt** / **igstAmt** / **gstAmt** — GST component amounts if present.
+- **cessPercent** / **cessAmt** — CESS % and amount exactly as printed.
+- **additionalCess** — GST Additional Cess at item level if present.
+- **cessFxdVl** / **cessFxdRt** — CESS Fixed Value or Fixed Rate if present.
+- **totalTaxAmt** — Total tax amount ONLY if explicitly labeled in item row.
+- **totalBaseValue** — Taxable/base amount for the line item if present.
+- **totalValueWithTax** — Final line item total inclusive of tax.
+- **discountPercent** / **discountAmt** — Item-level discount % or amount if present.
+"""
     
-    def _get_header_prompt(
+    def _get_extraction_prompt(
         self,
         extracted_text: str,
         confirmed_section: str = ""
     ) -> str:
-        """Get user prompt for header/financial extraction only (no items array)."""
+        """Get the single comprehensive prompt for full PO extraction."""
+        # Note: In a single pass, we provide the full schema structure.
         schema = {
             "purchaseOrder": {
-                "poNumber": "string or null",
-                "poDate": "string or null",
-                "expiryDate": "string or null",
+                "poNumber": "string",
+                "poDate": "string",
+                "expiryDate": "string",
                 "buyer": {
-                    "companyName": "string or null",
-                    "address": "string or null",
-                    "gstno": "string or null",
-                    "tin": "string or null",
-                    "email": "string or null",
-                    "phone": "string or null"
+                    "companyName": "string",
+                    "address": "string",
+                    "gstno": "string",
+                    "tin": "string",
+                    "pan": "string",
+                    "email": "string",
+                    "phone": "string"
                 },
                 "seller": {
-                    "companyName": "string or null",
-                    "address": "string or null",
-                    "email": "string or null",
-                    "gstno": "string or null",
-                    "tin": "string or null",
-                    "phone": "string or null"
+                    "companyName": "string",
+                    "address": "string",
+                    "gstno": "string",
+                    "tin": "string",
+                    "pan": "string",
+                    "email": "string",
+                    "phone": "string"
                 },
                 "financialSummary": {
-                    "totalBasicValue": "string or null",
-                    "totalCGST": "string or null",
-                    "totalSGST": "string or null",
-                    "totalIGST": "string or null",
-                    "totalTaxAmt": "string or null",
-                    "totalOrderValue": "string or null",
-                    "totalQuantity": "string or null",
-                    "discountPercent": "string or null",
-                    "discountAmt": "string or null"
-                }
+                    "totalBasicValue": "string",
+                    "totalCGST": "string",
+                    "totalSGST": "string",
+                    "totalIGST": "string",
+                    "totalTaxAmt": "string",
+                    "totalOrderValue": "string",
+                    "discountPercent": "string",
+                    "discountAmt": "string",
+                    "gstCompensationCess": "string",
+                    "gstAdditionalCess": "string",
+                    "totalQuantity": "string"
+                },
+                "items": [
+                    {
+                        "srNo": "string",
+                        "articleCode": "string",
+                        "hsnCode": "string",
+                        "eanCode": "string",
+                        "vendorArticleNo": "string",
+                        "vendorItemNo": "string",
+                        "productDescription": "string",
+                        "deliveryDate": "string",
+                        "quantityCarton": "string",
+                        "uomCarton": "string",
+                        "quantityEach": "string",
+                        "uomEach": "string",
+                        "mrpcarton": "string",
+                        "mrpeach": "string",
+                        "basicCostPrice": "string",
+                        "landingRate": "string",
+                        "gstPercent": "string",
+                        "cgstPercent": "string",
+                        "sgstPercent": "string",
+                        "igstPercent": "string",
+                        "cgstAmt": "string",
+                        "sgstAmt": "string",
+                        "igstAmt": "string",
+                        "gstAmt": "string",
+                        "cessPercent": "string",
+                        "cessAmt": "string",
+                        "additionalCess": "string",
+                        "cessFxdVl": "string",
+                        "cessFxdRt": "string",
+                        "totalTaxAmt": "string",
+                        "totalBaseValue": "string",
+                        "totalValueWithTax": "string",
+                        "discountPercent": "string",
+                        "discountAmt": "string"
+                    }
+                ]
             }
         }
 
@@ -779,71 +612,14 @@ The text layout uses spaces to preserve the original document structure — valu
 {extracted_text}
 </DOCUMENT>{confirmed_block}
 
-Fill this schema (header fields only, no items):
+Fill this schema (return FULL purchaseOrder object):
 
 <SCHEMA>
 {json.dumps(schema, indent=2)}
 </SCHEMA>
 
-Special rule for financialSummary.totalQuantity:
-- Look for a summary/footer row (often on the LAST page). It may be labeled "Grand Total of Qty", "NET TOTAL", "GRAND TOTAL", "Total", or similar.
-- That row often contains TWO numbers: one positioned under the Qty/Quantity column and one under the Amount/Total column.
-- The number under the Qty column = totalQuantity. The number under the Amount column = totalOrderValue.
-- Extract totalQuantity even when it has NO explicit label — rely on its column position.
-
-Return only valid JSON. Missing values = null."""
-
-    def _get_items_prompt(self, extracted_text: str) -> str:
-        """Get user prompt for extracting ALL line items only."""
-        item_schema = {
-            "srNo": "string or null",
-            "articleCode": "string or null",
-            "hsnCode": "string or null",
-            "eanCode": "string or null",
-            "productDescription": "string or null",
-            "deliveryDate": "string or null",
-            "quantityCarton": "string or null",
-            "quantityEach": "string or null",
-            "uomCarton": "string or null",
-            "uomEach": "string or null",
-            "mrpcarton": "string or null",
-            "mrpeach": "string or null",
-            "basicCostPrice": "string or null",
-            "landingRate": "string or null",
-            "gstPercent": "string or null",
-            "cgstPercent": "string or null",
-            "sgstPercent": "string or null",
-            "igstPercent": "string or null",
-            "cgstAmt": "string or null",
-            "sgstAmt": "string or null",
-            "igstAmt": "string or null",
-            "gstAmt": "string or null",
-            "cessPercent": "string or null",
-            "cessAmt": "string or null",
-            "cessFxdVl": "string or null",
-            "cessFxdRt": "string or null",
-            "totalTaxAmt": "string or null",
-            "totalBaseValue": "string or null",
-            "totalValueWithTax": "string or null",
-            "discountPercent": "string or null",
-            "discountAmt": "string or null"
-        }
-
-        return f"""Read the document below and extract every line item from the product/items table.
-
-<DOCUMENT>
-{extracted_text}
-</DOCUMENT>
-
-Return a JSON object with a single "items" array containing every row. Missing cell = null. No truncation.
-
-<SCHEMA>
-{{
-  "items": [
-    {json.dumps(item_schema, indent=4)}
-  ]
-}}
-</SCHEMA>
-
-Return only valid JSON."""
+Return only valid MINIFIED JSON. Missing values = OMIT KEY."""
+    # ── Legacy prompts (Deprecated) ───────────────────────────────────────────
+    def _get_header_prompt(self, *args, **kwargs): return ""
+    def _get_items_prompt(self, *args, **kwargs): return ""
 

@@ -26,7 +26,7 @@ class AppSettings:
     # ── Model ─────────────────────────────────────────────────────────────────
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "MODEL_NAME", "mistralai/mixtral-8x22b-instruct-v0.1"
+            "MODEL_NAME", "qwen/qwen3.5-122b-a10b"
         )
     )
     api_base_url: str = field(

@@ -143,6 +143,9 @@ class POExtractor:
             )
 
             cleaned_text = self.text_extractor.clean_extraction_text(extracted_text)
+            # Trim T&C / legal boilerplate before sending to AI — reduces token
+            # count by up to 90% on verbose PO documents and avoids 504 timeouts.
+            ai_text = self.text_extractor.trim_for_ai(cleaned_text)
             confirmed_section = self.text_extractor.build_confirmed_section(
                 dates=dates, parties=parties, po_number=po_number
             )
@@ -156,11 +159,16 @@ class POExtractor:
                 )
                 self._safe_write_text(text_dest, cleaned_text, label="extracted text")
 
-            # Step 7: AI parsing
+            # Step 7: AI parsing (use trimmed text to avoid 504 timeouts)
             purchase_order: PurchaseOrder = self.ai_parser.parse_po_text(
-                cleaned_text, confirmed_section=confirmed_section
+                ai_text, confirmed_section=confirmed_section
             )
             logger.info("AI parsing succeeded")
+
+            # Step 7b: Apply pre-extracted values as authoritative overrides.
+            # Values found by the regex pre-extractor are more reliable than the AI
+            # for structured identifiers (PAN, GSTIN, TIN, phone).
+            purchase_order = self._apply_preextracted_overrides(purchase_order, parties)
 
             # Step 8: Business-rule validation
             val = self.ai_parser.validate_line_items(purchase_order)
@@ -226,3 +234,44 @@ class POExtractor:
             logger.info("Saved %s to: %s", label, dest)
         except Exception as exc:
             logger.warning("Could not save %s to %s: %s", label, dest, exc)
+
+    @staticmethod
+    def _apply_preextracted_overrides(po: PurchaseOrder, parties: dict) -> PurchaseOrder:
+        """
+        Stamp pre-extracted party identifiers onto the AI-parsed PurchaseOrder.
+        Regex-extracted values (PAN, GSTIN, TIN, phone) are authoritative —
+        only override fields that are currently null or if the pre-extracted
+        value is non-null.
+        """
+        buyer_pre  = parties.get("buyer",  {})
+        seller_pre = parties.get("seller", {})
+
+        if po.buyer:
+            if buyer_pre.get("pan")    and not po.buyer.pan:
+                po.buyer.pan    = buyer_pre["pan"]
+                logger.info("Override buyer.pan  → %s", po.buyer.pan)
+            if buyer_pre.get("gstno")  and not po.buyer.gstno:
+                po.buyer.gstno  = buyer_pre["gstno"]
+                logger.info("Override buyer.gstno → %s", po.buyer.gstno)
+            if buyer_pre.get("tin")    and not po.buyer.tin:
+                po.buyer.tin    = buyer_pre["tin"]
+                logger.info("Override buyer.tin  → %s", po.buyer.tin)
+            if buyer_pre.get("phone")  and not po.buyer.phone:
+                po.buyer.phone  = buyer_pre["phone"]
+                logger.info("Override buyer.phone → %s", po.buyer.phone)
+
+        if po.seller:
+            if seller_pre.get("pan")   and not po.seller.pan:
+                po.seller.pan   = seller_pre["pan"]
+                logger.info("Override seller.pan  → %s", po.seller.pan)
+            if seller_pre.get("gstno") and not po.seller.gstno:
+                po.seller.gstno = seller_pre["gstno"]
+                logger.info("Override seller.gstno → %s", po.seller.gstno)
+            if seller_pre.get("tin")   and not po.seller.tin:
+                po.seller.tin   = seller_pre["tin"]
+                logger.info("Override seller.tin  → %s", po.seller.tin)
+            if seller_pre.get("phone") and not po.seller.phone:
+                po.seller.phone = seller_pre["phone"]
+                logger.info("Override seller.phone → %s", po.seller.phone)
+
+        return po

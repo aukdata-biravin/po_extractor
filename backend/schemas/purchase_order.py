@@ -12,6 +12,7 @@ class BuyerInfo(BaseModel):
     address: Optional[str] = None
     gstno: Optional[str] = None
     tin: Optional[str] = None
+    pan: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
 
@@ -23,6 +24,7 @@ class SellerInfo(BaseModel):
     email: Optional[str] = None
     gstno: Optional[str] = None
     tin: Optional[str] = None
+    pan: Optional[str] = None
     phone: Optional[str] = None
 
 
@@ -38,6 +40,10 @@ class FinancialSummary(BaseModel):
     totalQuantity: Optional[str] = None
     discountPercent: Optional[str] = None
     discountAmt: Optional[str] = None
+    gstCompensationCess: Optional[str] = None
+    gstAdditionalCess: Optional[str] = None
+
+
 class OrderItem(BaseModel):
     """Individual line item in the purchase order."""
     srNo: Optional[str] = None
@@ -64,6 +70,7 @@ class OrderItem(BaseModel):
     gstAmt: Optional[str] = None
     cessPercent: Optional[str] = None
     cessAmt: Optional[str] = None
+    additionalCess: Optional[str] = None
     cessFxdVl: Optional[str] = None
     cessFxdRt: Optional[str] = None
     totalTaxAmt: Optional[str] = None
