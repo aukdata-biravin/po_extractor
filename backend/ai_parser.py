@@ -451,7 +451,7 @@ Extract only from the summary/footer/totals section. Do NOT sum item-level value
 - **financialSummary.totalBasicValue** — Total Basic Value / Subtotal / Taxable Amount, else null.
 - **financialSummary.totalCGST** — Total CGST amount, else null.
 - **financialSummary.totalSGST** — Total SGST amount, else null.
-- **financialSummary.totalIGST** — Total IGST amount, else null.
+- **financialSummary.totalIGST** — Total IGST amount, else null. (CRITICAL: MUST extract "0.00" or "0" if printed. Never omit if present in text).
 - **financialSummary.totalTaxAmt** — Combined Total GST / Total Tax Amount. Do NOT add CGST + SGST, else null.
 - **financialSummary.totalOrderValue** — Grand total / Net Total / Total Order Value / Total Amount, exactly as printed.
 - **financialSummary.discountPercent** — Overall discount %, else null.
@@ -508,8 +508,8 @@ Mandatory mapping: srNo=1, articleCode=490001912, eanCode=8906001050490, product
 - **basicCostPrice** — Unit cost/rate BEFORE tax (Basic, Cost Price, Basic Rate).
 - **landingRate** — Unit rate AFTER tax (Landing Rate, Landing, Rate incl. tax). Extract this even if the value is identical to the MRP.
 - **gstPercent** — Combined GST % ONLY if a single "GST %" column exists.
-- **cgstPercent** / **sgstPercent** / **igstPercent** — Component GST percentages if present.
-- **cgstAmt** / **sgstAmt** / **igstAmt** / **gstAmt** — GST component amounts if present.
+- **cgstPercent** / **sgstPercent** / **igstPercent** — Component GST percentages if present. (CRITICAL: MUST extract "0.00" or "0" if printed. Never omit if present in text).
+- **cgstAmt** / **sgstAmt** / **igstAmt** / **gstAmt** — GST component amounts if present. (CRITICAL: MUST extract "0.00" or "0" if printed. Never omit if present in text).
 - **cessPercent** / **cessAmt** — CESS % and amount exactly as printed.
 - **additionalCess** — GST Additional Cess at item level if present.
 - **cessFxdVl** / **cessFxdRt** — CESS Fixed Value or Fixed Rate if present.
